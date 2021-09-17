@@ -8,6 +8,12 @@ def main():
 
     default_params = {
         'model': 'gpt2-xl',
+        # 'model': 'fairseq_lm_checkpoint_1_1000.pt',
+        # 'model': 'fairseq_lm_checkpoint_1_10000.pt',
+        # 'model': 'fairseq_lm_checkpoint_1_20000.pt',
+        # 'model': 'fairseq_lm_checkpoint_1_30000.pt',
+        'model': 'fairseq_lm_checkpoint_1_40000.pt',
+        # 'model': 'fairseq_lm_checkpoint_1_50000.pt',
         'dataset': None,
         'seed': None,
         'num_shots': None,
@@ -19,7 +25,8 @@ def main():
     }
 
     # generate all params to try
-    all_shots = [0, 1, 4, 8]
+    # all_shots = [0, 1, 4, 8]
+    all_shots = [1, 4, 8]
     num_seeds = 5
 
     all_params = []
@@ -42,7 +49,7 @@ def main():
 
     for param_index, params in enumerate(all_params):
         print(f"\n{params['expr_name']}")
-
+        start_time = time.monotonic()
         # load the data
         all_train_sentences, all_train_labels, all_test_sentences, all_test_labels = load_dataset(params)
         if params['template'] == "INVALID":
@@ -91,8 +98,12 @@ def main():
         cf_tokens = ["[MASK]", "N/A", "BLANK"]
         cf_probs_dict = defaultdict(lambda: [])
 
-        if "gpt2" in params['model']:
+        if "gpt2" in params['model'] or 'fairseq_lm' in params['model']:
             cf_prompts = []
+            if 'fairseq_lm' in params['model']:
+                # adjust for the fairseq_lm
+                cf_tokens = ['<mask>', "n/a", "blank"]
+
             for entity in cf_tokens:
                 prompt = params['prompt_func'](params, train_sentences, train_labels, entity, test_label_option=None)
                 cf_prompts.append(prompt)
@@ -192,7 +203,7 @@ def main():
         print(f"New accuracy: {calibrated_correctness:.5f}")
 
         
-        
+        print(f'Time: {(time.monotonic()-start_time):.5f}')
 
         orig_accuracy_list.append(orig_correctness)
         calibrated_accuracy_list.append(calibrated_correctness)

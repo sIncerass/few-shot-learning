@@ -7,6 +7,8 @@ import torch
 import pickle
 import openai
 from transformers import GPT2Tokenizer, GPT2LMHeadModel
+import time
+
 tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
 
 ROOT_DIR = os.path.dirname(os.path.realpath(__file__))
@@ -23,9 +25,9 @@ def chunks(lst, n):
 def chunk_size_helper(params):
     # Set the batch size (the size of the chunks determines the batch size). Default to 4 for GPT-2 and 20 for OpenAI if
     # no batch size is specified.
-    bs = params['bs']
+    bs = None if 'bs' not in params else params['bs']
     if bs is None:
-        if 'gpt2' in params['model']:
+        if 'gpt2' in params['model'] or 'fairseq_lm' in params['model']:
             return 1
         else:
             assert params['model'] in ['ada', 'babbage', 'curie', 'davinci', 'ada-beta', 'babbage-beta', 'curie-beta', 'davinci-beta']
@@ -66,6 +68,149 @@ def setup_gpt3():
     with open(os.path.join(ROOT_DIR, 'openai_key.txt'), 'r') as f:
         key = f.readline().strip()
         openai.api_key = key
+
+fairseq_lm = None
+def setup_fairseq_lm(model):
+    # load fairseq lm 
+    global fairseq_lm
+    from fairseq.hub_utils import from_pretrained, GeneratorHubInterface
+    
+    model_path = model.replace('fairseq_lm_', '')
+    fairseq_pretrain = from_pretrained(
+        '/home/sheng/lm/lm_ckpts/',
+        # 'checkpoint_1_1000.pt',
+        model_path,
+        ".",
+        bpe='gpt2'
+    )
+    fairseq_lm = GeneratorHubInterface( fairseq_pretrain['args'], models=fairseq_pretrain['models'], task=fairseq_pretrain['task'] )
+    fairseq_lm.cuda()
+    # print(fairseq_lm.bpe)
+
+def complete_fairseq_lm(prompt, l=10, model_name='fairseq_lm', num_log_probs=None, echo=False):
+    ''' This function runs fairseq LM locally but places the outputs into an json that looks just like the one
+     provided by the OpenAI API. '''
+    # need the topk score and token at each step
+    from fairseq.data.data_utils import collate_tokens
+    from fairseq import utils
+
+    if isinstance(prompt, str):
+        prompt = [prompt] # the code below assumes a list
+
+    pad_idx, eos_idx, bos_idx = fairseq_lm.src_dict.pad(), fairseq_lm.src_dict.eos(), fairseq_lm.src_dict.bos()
+    prompt_encode_sequences = collate_tokens([fairseq_lm.encode(sentence) for sentence in prompt], pad_idx=pad_idx)
+
+    generate_l = l
+    # greedily generate l tokens
+    if l > 0:
+        # the generate function can handle left padded inputs automatically in HF
+        # total_sequences is now the input + possible generated output
+        total_sequences = fairseq_lm.sample( prompt, beam=1, max_len_a=1, max_len_b=l )
+        total_encode_sequences = collate_tokens([fairseq_lm.encode(sentence) for sentence in total_sequences], pad_idx=pad_idx)
+        generate_l = total_encode_sequences.shape[-1] - prompt_encode_sequences.shape[-1]
+        if generate_l == 0:
+            # ensure we generate at least one token
+            total_sequences = fairseq_lm.sample( prompt, beam=2, max_len_a=1, max_len_b=l )
+            total_encode_sequences = collate_tokens([fairseq_lm.encode(sentence) for sentence in total_sequences], pad_idx=pad_idx)
+            generate_l = total_encode_sequences.shape[-1] - prompt_encode_sequences.shape[-1]
+        assert generate_l > 0
+    else:
+        assert echo == True and l == 0
+        total_sequences = prompt
+        total_encode_sequences = prompt_encode_sequences
+
+    # print(pad_idx, eos_idx, bos_idx, echo)
+    # print(total_encode_sequences.device, total_encode_sequences.shape)
+    # print(total_sequences, l, num_log_probs)
+    # print(total_encode_sequences, prompt_encode_sequences)
+    # print(total_sequences, generate_l, num_log_probs, prompt)
+    # for item in total_encode_sequences[0]:
+    #     print(item, fairseq_lm.decode(item.unsqueeze(0)))
+
+    if num_log_probs != None:
+        fariseq_lm_model = fairseq_lm.models[0]
+        with utils.model_eval(fariseq_lm_model):
+            logits, extra = fariseq_lm_model(
+                total_encode_sequences.to(device=fairseq_lm.device),
+                return_all_hiddens=False,
+            )
+
+        # -1 for eos token
+        if not echo:
+            # get the top tokens and probs for the generated l tokens
+            probs = torch.softmax(logits[:,-generate_l-1-1:-1], dim=2).cpu()
+        else:
+            # get the top tokens and probs for the context and the generated l tokens
+            probs = torch.softmax(logits[:, :-1], dim=2).cpu()
+
+        top_probs, top_tokens = torch.topk(probs, k=num_log_probs)
+        logprobs = torch.log(probs)
+        top_log_probs = torch.log(top_probs)
+
+    # construct batched tokens
+    # create the return value to resemble OpenAI
+    return_json = {}
+    choices = []
+    for batch_id in range(len(prompt)):
+        curr_json = {}
+        # text is just the optional context and next l tokens
+        if not echo:
+            curr_json['text'] = fairseq_lm.decode(total_encode_sequences[batch_id][-generate_l-1:])
+        else:
+            curr_json['text'] = fairseq_lm.decode(total_encode_sequences[batch_id])
+
+        # fill the return json with the top tokens and probs to match the OpenAI return value.
+        if num_log_probs is not None:
+            curr_json['logprobs'] = {}
+            curr_json['logprobs']['top_logprobs'] = []
+            curr_json['logprobs']['token_logprobs'] = []
+            curr_json['logprobs']['tokens'] = []
+            if not echo:
+                # cutoff the -1 here because the probs are shifted one over for LMs
+                for current_element_top_log_probs, current_element_top_tokens in zip(top_log_probs[batch_id][:-1], top_tokens[batch_id][:-1]):
+                    # tokens is a list of the top token at each position
+                    curr_json['logprobs']['tokens'].append(fairseq_lm.decode(current_element_top_tokens[0].unsqueeze(0)))
+                    # token_logprobs is a list of the logprob of the top token at each position
+                    curr_json['logprobs']['token_logprobs'].append(current_element_top_log_probs[0].item())
+                    # top_logprobs is a list of dicts for the top K tokens. with each entry being {'token_name': log_prob}
+                    temp = {}
+                    for log_prob, token in zip(current_element_top_log_probs, current_element_top_tokens):
+                        try:
+                            temp[fairseq_lm.decode(token.unsqueeze(0))] = log_prob.item()
+                        except:
+                            # madeupwords
+                            temp[fairseq_lm.string(token.unsqueeze(0))] = log_prob.item()
+                    curr_json['logprobs']['top_logprobs'].append(temp)
+            else:
+                # same as not above but small tweaks
+                # we add null to the front because for the GPT models, they have null probability for the first token
+                # (for some reason they don't have an beginning of sentence token)
+                # curr_json['logprobs']['top_logprobs'].append('null') this is not for fairseq lm
+                # cutoff the -1 here because the probs are shifted one over for LMs
+                for index, (current_element_top_log_probs, current_element_top_tokens) in enumerate(zip(top_log_probs[batch_id][:-1], top_tokens[batch_id][:-1])):
+                    # skip padding tokens
+                    if total_encode_sequences[batch_id][index].item() == pad_idx or total_encode_sequences[batch_id][index].item() == eos_idx:
+                        continue
+                    temp = {}
+                    for log_prob, token in zip(current_element_top_log_probs, current_element_top_tokens):
+                        try:
+                            temp[fairseq_lm.decode(token.unsqueeze(0))] = log_prob.item()
+                        except:
+                            # madeupwords
+                            temp[fairseq_lm.string(token.unsqueeze(0))] = log_prob.item()
+                    curr_json['logprobs']['top_logprobs'].append(temp)
+
+                for index in range(len(probs[batch_id])):
+                    curr_json['logprobs']['tokens'].append(fairseq_lm.decode(total_encode_sequences[batch_id][index].unsqueeze(0)))
+                # curr_json['logprobs']['token_logprobs'].append('null')
+                for index, log_probs_token_position_j in enumerate(logprobs[batch_id][:-1]):
+                    # probs are left shifted for LMs 
+                    curr_json['logprobs']['token_logprobs'].append(log_probs_token_position_j[total_encode_sequences[batch_id][index]])
+        
+        choices.append(curr_json)
+
+    return_json['choices'] = choices
+    return return_json
 
 def complete_gpt2(prompt, l=10, model_name='gpt2-xl', num_log_probs=None, echo=False):
     ''' This function runs GPT-2 locally but places the outputs into an json that looks just like the one
@@ -183,9 +328,13 @@ def complete(prompt, l, model, temp=0, num_log_probs=None, echo=False, n=None):
         assert temp == 0 # unsupported at the moment
         setup_gpt2(model)
         return complete_gpt2(prompt, l=l, model_name=model, num_log_probs=num_log_probs, echo=echo)
-    else:
+    elif 'gpt3' in model:
         setup_gpt3()
         return complete_gpt3(prompt, l=l, model_name=model, num_log_probs=num_log_probs, echo=echo, n=n)
+    elif 'fairseq_lm' in model:
+        if fairseq_lm is None:
+            setup_fairseq_lm(model)
+        return complete_fairseq_lm(prompt, l=l, model_name=model, num_log_probs=num_log_probs, echo=echo)
 
 def construct_prompt(params, train_sentences, train_labels, test_sentence):
     """construct a single prompt to be fed into the model"""
